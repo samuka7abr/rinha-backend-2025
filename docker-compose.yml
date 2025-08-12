@@ -14,14 +14,14 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
+          cpus: "0.10" # Ajustado para dar mais CPU para o app e DB
           memory: "20MB"
     restart: always
     networks:
       - rinha-net
 
   app-1:
-    build: . 
+    build: .
     container_name: app-1
     environment:
       - SERVICE_PORT=8080
@@ -40,8 +40,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.55"
-          memory: "130MB"
+          cpus: "0.55" # Ajustado
+          memory: "130MB" # Ajustado
     restart: always
     networks:
       - rinha-net
@@ -67,8 +67,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.55"
-          memory: "130MB"
+          cpus: "0.55" # Ajustado
+          memory: "130MB" # Ajustado
     restart: always
     networks:
       - rinha-net
@@ -87,8 +87,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20"
-          memory: "50MB"
+          cpus: "0.20" # Ajustado
+          memory: "50MB"  # Ajustado
     restart: always
     networks:
       - rinha-net
@@ -99,8 +99,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
-          memory: "20MB"
+          cpus: "0.10" # Ajustado
+          memory: "20MB"  # Ajustado
     restart: always
     networks:
       - rinha-net

@@ -1,0 +1,10 @@
+{
+  "name": "Samuel Abrao",
+  "social": ["https://github.com/SEU_USUARIO", "https://x.com/SEU_USUARIO"],
+  "source-code-repo": "https://github.com/SEU_USUARIO/SEU_REPO",
+  "langs": ["preencher"],
+  "storages": ["preencher"],
+  "messaging": [],
+  "load-balancers": ["nginx"],
+  "other-technologies": ["preencher"]
+} 

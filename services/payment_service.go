@@ -194,6 +194,84 @@ func (ps *PaymentService) tryProcessor(req models.PaymentProcessorRequest, url, 
 	return record, nil
 }
 
+func (ps *PaymentService) GetPaymentsSummary(from, to *time.Time) (*models.PaymentsSummaryResponse, error) {
+	summaryKey := ps.generateSummaryKey(from, to)
+
+	if ps.redisService != nil {
+		cached, err := ps.redisService.GetCachedPaymentsSummary(summaryKey)
+		if err != nil {
+			ps.logger.WithError(err).Warn("Erro ao verificar cache do summary")
+		} else if cached != nil {
+			ps.logger.WithField("summaryKey", summaryKey).Debug("Summary encontrado no cache Redis")
+			return cached, nil
+		}
+	}
+
+	ps.logger.WithFields(logrus.Fields{
+		"from": from,
+		"to":   to,
+	}).Info("Consultando summary no banco de dados")
+
+	summaryMap, err := ps.repository.GetPaymentsSummary(from, to)
+	if err != nil {
+		ps.logger.WithError(err).Error("Erro ao consultar summary no banco")
+		return nil, fmt.Errorf("erro ao obter summary: %w", err)
+	}
+
+	response := &models.PaymentsSummaryResponse{}
+
+	if defaultSummary, exists := summaryMap["default"]; exists {
+		response.Default = defaultSummary
+	} else {
+		response.Default = models.ProcessorSummary{
+			TotalRequests: 0,
+			TotalAmount:   0,
+		}
+	}
+
+	if fallbackSummary, exists := summaryMap["fallback"]; exists {
+		response.Fallback = fallbackSummary
+	} else {
+		response.Fallback = models.ProcessorSummary{
+			TotalRequests: 0,
+			TotalAmount:   0,
+		}
+	}
+
+	if ps.redisService != nil {
+		if err := ps.redisService.CachePaymentsSummary(summaryKey, response); err != nil {
+			ps.logger.WithError(err).Warn("Erro ao cachear summary no Redis")
+		}
+	}
+
+	ps.logger.WithFields(logrus.Fields{
+		"defaultRequests":  response.Default.TotalRequests,
+		"defaultAmount":    response.Default.TotalAmount,
+		"fallbackRequests": response.Fallback.TotalRequests,
+		"fallbackAmount":   response.Fallback.TotalAmount,
+	}).Info("Summary consultado com sucesso")
+
+	return response, nil
+}
+
+func (ps *PaymentService) generateSummaryKey(from, to *time.Time) string {
+	key := "summary"
+
+	if from != nil {
+		key += fmt.Sprintf(":from:%d", from.Unix())
+	}
+
+	if to != nil {
+		key += fmt.Sprintf(":to:%d", to.Unix())
+	}
+
+	if from == nil && to == nil {
+		key += ":all"
+	}
+
+	return key
+}
+
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value

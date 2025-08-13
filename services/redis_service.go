@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"my-rinha-go/models"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -246,4 +247,41 @@ func (rs *RedisService) GetCachedPaymentResult(correlationID string) (string, er
 	}
 
 	return result, nil
+}
+
+func (rs *RedisService) CachePaymentsSummary(summaryKey string, summary *models.PaymentsSummaryResponse) error {
+	ctx, cancel := context.WithTimeout(rs.ctx, 1*time.Second)
+	defer cancel()
+
+	data, err := json.Marshal(summary)
+	if err != nil {
+		return fmt.Errorf("erro ao serializar summary: %w", err)
+	}
+
+	if err := rs.client.Set(ctx, summaryKey, data, 30*time.Second).Err(); err != nil {
+		return fmt.Errorf("erro ao cachear summary: %w", err)
+	}
+
+	rs.logger.WithField("summaryKey", summaryKey).Debug("Summary cacheado no Redis")
+	return nil
+}
+
+func (rs *RedisService) GetCachedPaymentsSummary(summaryKey string) (*models.PaymentsSummaryResponse, error) {
+	ctx, cancel := context.WithTimeout(rs.ctx, 1*time.Second)
+	defer cancel()
+
+	data, err := rs.client.Get(ctx, summaryKey).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil 
+		}
+		return nil, fmt.Errorf("erro ao buscar summary cache: %w", err)
+	}
+
+	var summary models.PaymentsSummaryResponse
+	if err := json.Unmarshal([]byte(data), &summary); err != nil {
+		return nil, fmt.Errorf("erro ao deserializar summary: %w", err)
+	}
+
+	return &summary, nil
 }

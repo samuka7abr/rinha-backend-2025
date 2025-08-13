@@ -37,6 +37,7 @@ func main() {
 
 	http.HandleFunc("/", helloHandler)
 	http.HandleFunc("/payments", paymentHandler.PostPayments)
+	http.HandleFunc("/payments-summary", paymentHandler.GetPaymentsSummary)
 
 	port := "8080"
 	fmt.Printf("Servidor iniciado na porta %s\n", port)

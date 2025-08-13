@@ -273,7 +273,7 @@ func (rs *RedisService) GetCachedPaymentsSummary(summaryKey string) (*models.Pay
 	data, err := rs.client.Get(ctx, summaryKey).Result()
 	if err != nil {
 		if err == redis.Nil {
-			return nil, nil 
+			return nil, nil
 		}
 		return nil, fmt.Errorf("erro ao buscar summary cache: %w", err)
 	}

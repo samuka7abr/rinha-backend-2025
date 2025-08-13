@@ -16,8 +16,10 @@ import (
 )
 
 type MockPaymentService struct {
-	shouldError bool
-	processor   string
+	shouldError        bool
+	processor          string
+	summaryShouldError bool
+	summaryResp        *models.PaymentsSummaryResponse
 }
 
 func (m *MockPaymentService) ProcessPayment(req models.PaymentRequest) (*models.PaymentRecord, error) {
@@ -37,6 +39,19 @@ func (m *MockPaymentService) ProcessPayment(req models.PaymentRequest) (*models.
 		Processor:     processor,
 		ProcessedAt:   time.Now().UTC(),
 		CreatedAt:     time.Now().UTC(),
+	}, nil
+}
+
+func (m *MockPaymentService) GetPaymentsSummary(from, to *time.Time) (*models.PaymentsSummaryResponse, error) {
+	if m.summaryShouldError {
+		return nil, fmt.Errorf("erro simulado no summary")
+	}
+	if m.summaryResp != nil {
+		return m.summaryResp, nil
+	}
+	return &models.PaymentsSummaryResponse{
+		Default:  models.ProcessorSummary{TotalRequests: 0, TotalAmount: 0},
+		Fallback: models.ProcessorSummary{TotalRequests: 0, TotalAmount: 0},
 	}, nil
 }
 
@@ -200,5 +215,139 @@ func TestPaymentHandler_PostPayments_EmptyBody(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("Esperado status %d, obtido %d", http.StatusBadRequest, w.Code)
+	}
+}
+
+func TestPaymentHandler_GetPaymentsSummary_OK(t *testing.T) {
+	summary := &models.PaymentsSummaryResponse{
+		Default:  models.ProcessorSummary{TotalRequests: 10, TotalAmount: 1000},
+		Fallback: models.ProcessorSummary{TotalRequests: 2, TotalAmount: 200},
+	}
+	mockService := &MockPaymentService{summaryResp: summary}
+	handler := handlers.NewPaymentHandler(mockService)
+
+	req := httptest.NewRequest(http.MethodGet, "/payments-summary", nil)
+	w := httptest.NewRecorder()
+
+	handler.GetPaymentsSummary(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Esperado status %d, obtido %d", http.StatusOK, w.Code)
+	}
+
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Esperado Content-Type application/json, obtido %s", ct)
+	}
+
+	var resp models.PaymentsSummaryResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Erro ao decodificar JSON: %v", err)
+	}
+
+	if resp.Default.TotalRequests != 10 || resp.Default.TotalAmount != 1000 {
+		t.Errorf("Resumo default incorreto: %+v", resp.Default)
+	}
+	if resp.Fallback.TotalRequests != 2 || resp.Fallback.TotalAmount != 200 {
+		t.Errorf("Resumo fallback incorreto: %+v", resp.Fallback)
+	}
+}
+
+func TestPaymentHandler_GetPaymentsSummary_WithFilters(t *testing.T) {
+	summary := &models.PaymentsSummaryResponse{
+		Default:  models.ProcessorSummary{TotalRequests: 1, TotalAmount: 50},
+		Fallback: models.ProcessorSummary{TotalRequests: 0, TotalAmount: 0},
+	}
+	mockService := &MockPaymentService{summaryResp: summary}
+	handler := handlers.NewPaymentHandler(mockService)
+
+	from := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	to := time.Now().UTC().Format(time.RFC3339)
+	req := httptest.NewRequest(http.MethodGet, "/payments-summary?from="+from+"&to="+to, nil)
+	w := httptest.NewRecorder()
+
+	handler.GetPaymentsSummary(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Esperado status %d, obtido %d", http.StatusOK, w.Code)
+	}
+}
+
+func TestPaymentHandler_GetPaymentsSummary_InvalidFrom(t *testing.T) {
+	mockService := &MockPaymentService{}
+	handler := handlers.NewPaymentHandler(mockService)
+
+	req := httptest.NewRequest(http.MethodGet, "/payments-summary?from=invalid-date", nil)
+	w := httptest.NewRecorder()
+
+	handler.GetPaymentsSummary(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Esperado status %d, obtido %d", http.StatusBadRequest, w.Code)
+	}
+
+	var response map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Erro ao decodificar JSON: %v", err)
+	}
+	if response["error"] != "Parâmetro 'from' inválido (use formato RFC3339)" {
+		t.Errorf("Mensagem de erro incorreta: %s", response["error"])
+	}
+}
+
+func TestPaymentHandler_GetPaymentsSummary_InvalidTo(t *testing.T) {
+	mockService := &MockPaymentService{}
+	handler := handlers.NewPaymentHandler(mockService)
+
+	req := httptest.NewRequest(http.MethodGet, "/payments-summary?to=invalid-date", nil)
+	w := httptest.NewRecorder()
+
+	handler.GetPaymentsSummary(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Esperado status %d, obtido %d", http.StatusBadRequest, w.Code)
+	}
+
+	var response map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Erro ao decodificar JSON: %v", err)
+	}
+	if response["error"] != "Parâmetro 'to' inválido (use formato RFC3339)" {
+		t.Errorf("Mensagem de erro incorreta: %s", response["error"])
+	}
+}
+
+func TestPaymentHandler_GetPaymentsSummary_ServiceError(t *testing.T) {
+	mockService := &MockPaymentService{summaryShouldError: true}
+	handler := handlers.NewPaymentHandler(mockService)
+
+	req := httptest.NewRequest(http.MethodGet, "/payments-summary", nil)
+	w := httptest.NewRecorder()
+
+	handler.GetPaymentsSummary(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("Esperado status %d, obtido %d", http.StatusInternalServerError, w.Code)
+	}
+}
+
+func TestPaymentHandler_GetPaymentsSummary_MethodNotAllowed(t *testing.T) {
+	mockService := &MockPaymentService{}
+	handler := handlers.NewPaymentHandler(mockService)
+
+	req := httptest.NewRequest(http.MethodPost, "/payments-summary", nil)
+	w := httptest.NewRecorder()
+
+	handler.GetPaymentsSummary(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("Esperado status %d, obtido %d", http.StatusMethodNotAllowed, w.Code)
+	}
+
+	var response map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Erro ao decodificar JSON: %v", err)
+	}
+	if response["error"] != "Método não permitido" {
+		t.Errorf("Mensagem de erro incorreta: %s", response["error"])
 	}
 }

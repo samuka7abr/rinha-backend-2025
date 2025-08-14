@@ -37,7 +37,6 @@ func (dc *DatabaseConfig) ConnectionString() string {
 
 func ConnectToDatabase(config *DatabaseConfig) (*sql.DB, error) {
 	logger := logrus.New()
-
 	logger.WithFields(logrus.Fields{
 		"host":   config.Host,
 		"port":   config.Port,
@@ -51,19 +50,16 @@ func ConnectToDatabase(config *DatabaseConfig) (*sql.DB, error) {
 		return nil, fmt.Errorf("erro ao conectar ao banco: %w", err)
 	}
 
-	// Configura pool de conexões
-	db.SetMaxOpenConns(25)
+	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(2 * time.Minute)
 
-	// Testa a conexão
-	err = db.Ping()
-	if err != nil {
+	if err = db.Ping(); err != nil {
 		db.Close()
 		logger.WithError(err).Error("Erro ao fazer ping no banco")
 		return nil, fmt.Errorf("erro ao testar conexão: %w", err)
 	}
-
 	logger.Info("Conexão com o banco estabelecida com sucesso")
 	return db, nil
 }
@@ -74,3 +70,4 @@ func getEnv(key, defaultValue string) string {
 	}
 	return defaultValue
 }
+ 

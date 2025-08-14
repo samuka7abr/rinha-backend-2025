@@ -285,3 +285,76 @@ func (rs *RedisService) GetCachedPaymentsSummary(summaryKey string) (*models.Pay
 
 	return &summary, nil
 }
+
+func (rs *RedisService) IncrementSummary(processor string, amount float64) error {
+	ctx, cancel := context.WithTimeout(rs.ctx, 1*time.Second)
+	defer cancel()
+
+	countKey := fmt.Sprintf("summary:all:%s:count", processor)
+	amountKey := fmt.Sprintf("summary:all:%s:amount", processor)
+
+	pipe := rs.client.Pipeline()
+	pipe.Incr(ctx, countKey)
+	pipe.IncrByFloat(ctx, amountKey, amount)
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("erro ao incrementar summary: %w", err)
+	}
+	return nil
+}
+
+func (rs *RedisService) GetLiveSummary() (*models.PaymentsSummaryResponse, error) {
+	ctx, cancel := context.WithTimeout(rs.ctx, 1*time.Second)
+	defer cancel()
+
+	keys := []string{
+		"summary:all:default:count",
+		"summary:all:default:amount",
+		"summary:all:fallback:count",
+		"summary:all:fallback:amount",
+	}
+	pipe := rs.client.Pipeline()
+	cmds := make([]*redis.StringCmd, 0, len(keys))
+	for _, k := range keys {
+		cmds = append(cmds, pipe.Get(ctx, k))
+	}
+	_, _ = pipe.Exec(ctx)
+
+	parseInt := func(cmd *redis.StringCmd) int {
+		v, err := cmd.Int()
+		if err != nil {
+			return 0
+		}
+		return v
+	}
+	parseFloat := func(cmd *redis.StringCmd) float64 {
+		v, err := cmd.Float64()
+		if err != nil {
+			return 0
+		}
+		return v
+	}
+
+	resp := &models.PaymentsSummaryResponse{
+		Default: models.ProcessorSummary{
+			TotalRequests: parseInt(cmds[0]),
+			TotalAmount:   parseFloat(cmds[1]),
+		},
+		Fallback: models.ProcessorSummary{
+			TotalRequests: parseInt(cmds[2]),
+			TotalAmount:   parseFloat(cmds[3]),
+		},
+	}
+	return resp, nil
+}
+
+func (rs *RedisService) TryLockCorrelation(correlationID string, ttl time.Duration) (bool, error) {
+	ctx, cancel := context.WithTimeout(rs.ctx, 50*time.Millisecond)
+	defer cancel()
+	key := fmt.Sprintf("dedupe:%s", correlationID)
+	ok, err := rs.client.SetNX(ctx, key, "1", ttl).Result()
+	if err != nil {
+		return false, fmt.Errorf("erro ao tentar dedupe no Redis: %w", err)
+	}
+	return ok, nil
+}

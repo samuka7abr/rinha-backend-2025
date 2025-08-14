@@ -2,17 +2,49 @@ package services
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
 	"fmt"
+	"math/rand"
+	"net"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"my-rinha-go/models"
 	"my-rinha-go/repositories"
 
 	"github.com/google/uuid"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/sirupsen/logrus"
+)
+
+type UpstreamStatusError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *UpstreamStatusError) Error() string { return e.Message }
+
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if ue, ok := err.(*UpstreamStatusError); ok {
+		if ue.StatusCode >= 400 && ue.StatusCode < 500 {
+			return false
+		}
+		return true
+	}
+	return true
+}
+
+type cbState int32
+
+const (
+	cbClosed cbState = iota
+	cbOpen
+	cbHalfOpen
 )
 
 type PaymentService struct {
@@ -22,19 +54,35 @@ type PaymentService struct {
 	logger       *logrus.Logger
 	repository   *repositories.PaymentRepository
 	redisService *RedisService
+
+	cbFailures     atomic.Int32
+	cbStatus       atomic.Int32
+	cbLastOpenTime atomic.Int64
 }
 
 func NewPaymentService(repository *repositories.PaymentRepository, redisService *RedisService) *PaymentService {
-	return &PaymentService{
-		defaultURL:  getEnv("PAYMENT_PROCESSOR_DEFAULT_URL", "http://payment-processor-default:8080"),
-		fallbackURL: getEnv("PAYMENT_PROCESSOR_FALLBACK_URL", "http://payment-processor-fallback:8080"),
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+	tr := &http.Transport{
+		MaxIdleConns:        512,
+		MaxIdleConnsPerHost: 512,
+		IdleConnTimeout:     60 * time.Second,
+		DisableCompression:  true,
+		DialContext: (&net.Dialer{
+			Timeout:   200 * time.Millisecond,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   0,
+		ExpectContinueTimeout: 0,
+	}
+	ps := &PaymentService{
+		defaultURL:   getEnv("PAYMENT_PROCESSOR_DEFAULT_URL", "http://payment-processor-default:8080"),
+		fallbackURL:  getEnv("PAYMENT_PROCESSOR_FALLBACK_URL", "http://payment-processor-fallback:8080"),
+		httpClient:   &http.Client{Transport: tr, Timeout: 450 * time.Millisecond},
 		logger:       logrus.New(),
 		repository:   repository,
 		redisService: redisService,
 	}
+	ps.cbStatus.Store(int32(cbClosed))
+	return ps
 }
 
 func (ps *PaymentService) ProcessPayment(req models.PaymentRequest) (*models.PaymentRecord, error) {
@@ -43,28 +91,11 @@ func (ps *PaymentService) ProcessPayment(req models.PaymentRequest) (*models.Pay
 	}
 
 	if ps.redisService != nil {
-		cached, err := ps.redisService.GetCachedPaymentResult(req.CorrelationID)
-		if err != nil {
-			ps.logger.WithError(err).Warn("Erro ao verificar cache Redis")
-		} else if cached != "" {
-			ps.logger.WithField("correlationId", req.CorrelationID).Info("Pagamento encontrado no cache Redis")
-			if record, err := ps.repository.GetPaymentByCorrelationID(req.CorrelationID); err == nil && record != nil {
-				return record, nil
+		if ok, err := ps.redisService.TryLockCorrelation(req.CorrelationID, 60*time.Second); err == nil {
+			if !ok {
+				return &models.PaymentRecord{CorrelationID: req.CorrelationID, Amount: req.Amount, Processor: "default", ProcessedAt: time.Now().UTC(), CreatedAt: time.Now().UTC()}, nil
 			}
 		}
-	}
-
-	existingPayment, err := ps.repository.GetPaymentByCorrelationID(req.CorrelationID)
-	if err != nil {
-		ps.logger.WithError(err).Warn("Erro ao verificar pagamento existente no banco")
-	} else if existingPayment != nil {
-		ps.logger.WithField("correlationId", req.CorrelationID).Info("Pagamento duplicado detectado no banco")
-
-		if ps.redisService != nil {
-			ps.redisService.CachePaymentResult(req.CorrelationID, "found")
-		}
-
-		return existingPayment, nil
 	}
 
 	processorReq := models.PaymentProcessorRequest{
@@ -72,111 +103,131 @@ func (ps *PaymentService) ProcessPayment(req models.PaymentRequest) (*models.Pay
 		Amount:        req.Amount,
 		RequestedAt:   time.Now().UTC(),
 	}
-
 	bestProcessor, err := ps.getBestProcessor()
 	if err != nil {
-		ps.logger.WithError(err).Warn("Erro ao determinar melhor processador, usando default")
 		bestProcessor = "default"
 	}
+	// Circuit breaker influence on routing
+	s := cbState(ps.cbStatus.Load())
+	if s == cbOpen {
+		last := time.Unix(0, ps.cbLastOpenTime.Load())
+		if time.Since(last) < 5*time.Second {
+			bestProcessor = "fallback"
+		} else {
+			ps.cbStatus.Store(int32(cbHalfOpen))
+		}
+	}
 
-	ps.logger.WithField("chosenProcessor", bestProcessor).Info("Processador escolhido pela estratégia inteligente")
+	budget := 450 * time.Millisecond
+	start := time.Now()
+	attempt1Timeout := 320 * time.Millisecond
+	attempt2Timeout := 120 * time.Millisecond
 
 	var record *models.PaymentRecord
 	var processingErr error
-
 	if bestProcessor == "default" {
-		record, processingErr = ps.tryProcessorWithMetrics(processorReq, ps.defaultURL, "default")
-		if processingErr != nil {
-			ps.logger.WithError(processingErr).Warn("Falha no processador default, tentando fallback")
-			record, processingErr = ps.tryProcessorWithMetrics(processorReq, ps.fallbackURL, "fallback")
+		record, processingErr = ps.tryProcessorWithMetrics(processorReq, ps.defaultURL, "default", attempt1Timeout)
+		if processingErr != nil && isRetryable(processingErr) {
+			if time.Since(start)+attempt2Timeout < budget {
+				// jitter curto antes do retry
+				time.Sleep(time.Duration(5+rand.Intn(10)) * time.Millisecond)
+				record, processingErr = ps.tryProcessorWithMetrics(processorReq, ps.fallbackURL, "fallback", attempt2Timeout)
+			}
 		}
 	} else {
-		record, processingErr = ps.tryProcessorWithMetrics(processorReq, ps.fallbackURL, "fallback")
-		if processingErr != nil {
-			ps.logger.WithError(processingErr).Warn("Falha no processador fallback, tentando default")
-			record, processingErr = ps.tryProcessorWithMetrics(processorReq, ps.defaultURL, "default")
-		}
+		// Quando escolhemos fallback como melhor, evitamos reverter para default para não amplificar carga
+		record, processingErr = ps.tryProcessorWithMetrics(processorReq, ps.fallbackURL, "fallback", attempt1Timeout)
 	}
-
 	if processingErr != nil {
-		ps.logger.WithError(processingErr).Error("Falha em ambos os processadores")
+		ps.onCallResult(false)
 		return nil, fmt.Errorf("falha ao processar pagamento: %w", processingErr)
 	}
+	ps.onCallResult(true)
 
-	if err := ps.repository.SavePayment(record); err != nil {
-		ps.logger.WithError(err).Error("Erro ao salvar pagamento no banco")
-	}
-
-	if ps.redisService != nil {
-		if err := ps.redisService.CachePaymentResult(req.CorrelationID, "processed"); err != nil {
-			ps.logger.WithError(err).Warn("Erro ao cachear resultado no Redis")
+	if record != nil {
+		ps.repository.EnqueuePayment(record)
+		if ps.redisService != nil {
+			_ = ps.redisService.CachePaymentResult(req.CorrelationID, "processed")
+			_ = ps.redisService.IncrementSummary(record.Processor, record.Amount)
 		}
 	}
-
-	ps.logger.WithFields(logrus.Fields{
-		"correlationId": req.CorrelationID,
-		"amount":        req.Amount,
-		"processor":     record.Processor,
-	}).Info("Pagamento processado com sucesso")
-
 	return record, nil
+}
+
+func (ps *PaymentService) onCallResult(success bool) {
+	state := cbState(ps.cbStatus.Load())
+	if state == cbHalfOpen {
+		if success {
+			ps.cbStatus.Store(int32(cbClosed))
+			ps.cbFailures.Store(0)
+			return
+		}
+		ps.cbStatus.Store(int32(cbOpen))
+		ps.cbLastOpenTime.Store(time.Now().UnixNano())
+		return
+	}
+	if !success {
+		if ps.cbFailures.Add(1) >= 4 {
+			ps.cbStatus.Store(int32(cbOpen))
+			ps.cbLastOpenTime.Store(time.Now().UnixNano())
+		}
+	} else {
+		ps.cbFailures.Store(0)
+	}
 }
 
 func (ps *PaymentService) getBestProcessor() (string, error) {
 	if ps.redisService == nil {
 		return "default", nil
 	}
-
 	return ps.redisService.GetBestProcessor()
 }
 
-func (ps *PaymentService) tryProcessorWithMetrics(req models.PaymentProcessorRequest, url, processor string) (*models.PaymentRecord, error) {
+func (ps *PaymentService) tryProcessorWithMetrics(req models.PaymentProcessorRequest, url, processor string, timeout time.Duration) (*models.PaymentRecord, error) {
 	start := time.Now()
-
-	record, err := ps.tryProcessor(req, url, processor)
-
-	duration := time.Since(start)
-	responseTimeMs := int(duration.Milliseconds())
-
+	record, err := ps.tryProcessor(req, url, processor, timeout)
+	d := time.Since(start)
 	if ps.redisService != nil {
 		success := err == nil
-		errorMsg := ""
+		errMsg := ""
 		if err != nil {
-			errorMsg = err.Error()
+			errMsg = err.Error()
 		}
-
-		ps.redisService.UpdateProcessorHealth(processor, success, responseTimeMs, errorMsg)
+		ps.redisService.UpdateProcessorHealth(processor, success, int(d.Milliseconds()), errMsg)
 	}
-
 	return record, err
 }
 
-func (ps *PaymentService) tryProcessor(req models.PaymentProcessorRequest, url, processor string) (*models.PaymentRecord, error) {
-	jsonData, err := json.Marshal(req)
+func (ps *PaymentService) tryProcessor(req models.PaymentProcessorRequest, url, processor string, timeout time.Duration) (*models.PaymentRecord, error) {
+	json := jsoniter.ConfigFastest
+	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("erro ao serializar requisição: %w", err)
+		return nil, err
 	}
-
-	httpReq, err := http.NewRequest("POST", url+"/payments", bytes.NewBuffer(jsonData))
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/payments", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("erro ao criar requisição HTTP: %w", err)
+		return nil, err
 	}
-
 	httpReq.Header.Set("Content-Type", "application/json")
-
-	start := time.Now()
 	resp, err := ps.httpClient.Do(httpReq)
-	duration := time.Since(start)
-
 	if err != nil {
-		return nil, fmt.Errorf("erro na requisição HTTP: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("processador retornou status %d", resp.StatusCode)
+	if resp.StatusCode == http.StatusUnprocessableEntity { // 422: idempotente
+		return &models.PaymentRecord{
+			CorrelationID: req.CorrelationID,
+			Amount:        req.Amount,
+			Processor:     processor,
+			ProcessedAt:   req.RequestedAt,
+			CreatedAt:     time.Now().UTC(),
+		}, nil
 	}
-
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, &UpstreamStatusError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("status %d", resp.StatusCode)}
+	}
 	record := &models.PaymentRecord{
 		CorrelationID: req.CorrelationID,
 		Amount:        req.Amount,
@@ -184,91 +235,49 @@ func (ps *PaymentService) tryProcessor(req models.PaymentProcessorRequest, url, 
 		ProcessedAt:   req.RequestedAt,
 		CreatedAt:     time.Now().UTC(),
 	}
-
-	ps.logger.WithFields(logrus.Fields{
-		"processor": processor,
-		"duration":  duration,
-		"status":    resp.StatusCode,
-	}).Debug("Requisição para processador concluída")
-
 	return record, nil
 }
 
 func (ps *PaymentService) GetPaymentsSummary(from, to *time.Time) (*models.PaymentsSummaryResponse, error) {
+	if from == nil && to == nil && ps.redisService != nil {
+		if live, err := ps.redisService.GetLiveSummary(); err == nil && live != nil {
+			return live, nil
+		}
+	}
 	summaryKey := ps.generateSummaryKey(from, to)
-
 	if ps.redisService != nil {
-		cached, err := ps.redisService.GetCachedPaymentsSummary(summaryKey)
-		if err != nil {
-			ps.logger.WithError(err).Warn("Erro ao verificar cache do summary")
-		} else if cached != nil {
-			ps.logger.WithField("summaryKey", summaryKey).Debug("Summary encontrado no cache Redis")
+		if cached, err := ps.redisService.GetCachedPaymentsSummary(summaryKey); err == nil && cached != nil {
 			return cached, nil
 		}
 	}
-
-	ps.logger.WithFields(logrus.Fields{
-		"from": from,
-		"to":   to,
-	}).Info("Consultando summary no banco de dados")
-
 	summaryMap, err := ps.repository.GetPaymentsSummary(from, to)
 	if err != nil {
-		ps.logger.WithError(err).Error("Erro ao consultar summary no banco")
 		return nil, fmt.Errorf("erro ao obter summary: %w", err)
 	}
-
 	response := &models.PaymentsSummaryResponse{}
-
-	if defaultSummary, exists := summaryMap["default"]; exists {
-		response.Default = defaultSummary
-	} else {
-		response.Default = models.ProcessorSummary{
-			TotalRequests: 0,
-			TotalAmount:   0,
-		}
+	if s, ok := summaryMap["default"]; ok {
+		response.Default = s
 	}
-
-	if fallbackSummary, exists := summaryMap["fallback"]; exists {
-		response.Fallback = fallbackSummary
-	} else {
-		response.Fallback = models.ProcessorSummary{
-			TotalRequests: 0,
-			TotalAmount:   0,
-		}
+	if s, ok := summaryMap["fallback"]; ok {
+		response.Fallback = s
 	}
-
 	if ps.redisService != nil {
-		if err := ps.redisService.CachePaymentsSummary(summaryKey, response); err != nil {
-			ps.logger.WithError(err).Warn("Erro ao cachear summary no Redis")
-		}
+		_ = ps.redisService.CachePaymentsSummary(summaryKey, response)
 	}
-
-	ps.logger.WithFields(logrus.Fields{
-		"defaultRequests":  response.Default.TotalRequests,
-		"defaultAmount":    response.Default.TotalAmount,
-		"fallbackRequests": response.Fallback.TotalRequests,
-		"fallbackAmount":   response.Fallback.TotalAmount,
-	}).Info("Summary consultado com sucesso")
-
 	return response, nil
 }
 
 func (ps *PaymentService) generateSummaryKey(from, to *time.Time) string {
 	key := "summary"
-
 	if from != nil {
 		key += fmt.Sprintf(":from:%d", from.Unix())
 	}
-
 	if to != nil {
 		key += fmt.Sprintf(":to:%d", to.Unix())
 	}
-
 	if from == nil && to == nil {
 		key += ":all"
 	}
-
 	return key
 }
 

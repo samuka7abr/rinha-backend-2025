@@ -1,9 +1,6 @@
-version: "3.8"
-
 services:
   nginx:
     image: nginx:1.27-alpine
-    container_name: rinha-nginx
     ports:
       - "9999:9999"
     volumes:
@@ -14,7 +11,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10" # Ajustado para dar mais CPU para o app e DB
+          cpus: "0.10"
           memory: "20MB"
     restart: always
     networks:
@@ -22,21 +19,20 @@ services:
 
   app-1:
     image: samuka7abrr/my-rinha-backend:latest
-    container_name: app-1
     environment:
-      - DB_HOST=rinha-postgres
+      - DB_HOST=postgres
       - DB_PORT=5432
-      - DB_USER=postgres
-      - DB_PASSWORD=postgres
+      - DB_USER=admin
+      - DB_PASSWORD=123
       - DB_NAME=rinha
-      - REDIS_ADDR=rinha-redis:6379
+      - REDIS_ADDR=redis:6379
       - PAYMENT_PROCESSOR_DEFAULT_URL=http://payment-processor-default:8080
       - PAYMENT_PROCESSOR_FALLBACK_URL=http://payment-processor-fallback:8080
     expose:
       - "8080"
     depends_on:
-      - rinha-postgres
-      - rinha-redis
+      - postgres
+      - redis
     deploy:
       resources:
         limits:
@@ -45,25 +41,24 @@ services:
     restart: always
     networks:
       - rinha-net
-      - payment-processor
+      - rinha
 
   app-2:
     image: samuka7abrr/my-rinha-backend:latest
-    container_name: app-2
     environment:
-      - DB_HOST=rinha-postgres
+      - DB_HOST=postgres
       - DB_PORT=5432
-      - DB_USER=postgres
-      - DB_PASSWORD=postgres
+      - DB_USER=admin
+      - DB_PASSWORD=123
       - DB_NAME=rinha
-      - REDIS_ADDR=rinha-redis:6379
+      - REDIS_ADDR=redis:6379
       - PAYMENT_PROCESSOR_DEFAULT_URL=http://payment-processor-default:8080
       - PAYMENT_PROCESSOR_FALLBACK_URL=http://payment-processor-fallback:8080
     expose:
       - "8080"
     depends_on:
-      - rinha-postgres
-      - rinha-redis
+      - postgres
+      - redis
     deploy:
       resources:
         limits:
@@ -72,11 +67,10 @@ services:
     restart: always
     networks:
       - rinha-net
-      - payment-processor
+      - rinha
 
   postgres:
     image: postgres:16-alpine
-    container_name: rinha-postgres
     environment:
       - POSTGRES_USER=admin
       - POSTGRES_PASSWORD=123
@@ -87,20 +81,19 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20" # Ajustado
-          memory: "50MB"  # Ajustado
+          cpus: "0.20"
+          memory: "50MB"
     restart: always
     networks:
       - rinha-net
 
   redis:
     image: redis:7.2-alpine
-    container_name: rinha-redis
     deploy:
       resources:
         limits:
-          cpus: "0.10" # Ajustado
-          memory: "20MB"  # Ajustado
+          cpus: "0.10"
+          memory: "20MB"
     restart: always
     networks:
       - rinha-net
@@ -111,5 +104,5 @@ volumes:
 networks:
   rinha-net:
     driver: bridge
-  payment-processor:
+  rinha:
     external: true

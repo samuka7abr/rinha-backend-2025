@@ -41,7 +41,7 @@ services:
     restart: always
     networks:
       - rinha-net
-      - rinha
+      - payment-processor
 
   app-2:
     image: samuka7abrr/my-rinha-backend:latest
@@ -67,7 +67,7 @@ services:
     restart: always
     networks:
       - rinha-net
-      - rinha
+      - payment-processor
 
   postgres:
     image: postgres:16-alpine
@@ -104,5 +104,5 @@ volumes:
 networks:
   rinha-net:
     driver: bridge
-  rinha:
+  payment-processor:
     external: true

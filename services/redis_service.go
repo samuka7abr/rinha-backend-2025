@@ -2,359 +2,160 @@ package services
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"my-rinha-go/models"
+	"os"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/sirupsen/logrus"
 )
 
-type ProcessorHealth struct {
-	Healthy          bool      `json:"healthy"`
-	LastResponseTime int       `json:"lastResponseTime"` // em ms
-	LastCheck        time.Time `json:"lastCheck"`
-	SuccessRate      float64   `json:"successRate"`
-	FailureCount     int       `json:"failureCount"`
-	TotalRequests    int       `json:"totalRequests"`
-	LastError        string    `json:"lastError,omitempty"`
+type redisMsg struct {
+	sec    int64
+	amount int64
 }
 
 type RedisService struct {
-	client *redis.Client
-	logger *logrus.Logger
-	ctx    context.Context
+	c      *redis.Client
+	ttl    time.Duration
+	in     chan redisMsg
+	wg     sync.WaitGroup
+	cancel context.CancelFunc
 }
 
-func NewRedisService() *RedisService {
-	addr := getEnv("REDIS_ADDR", "localhost:6379")
+func (s *RedisService) run(ctx context.Context) {
+	defer s.wg.Done()
 
-	client := redis.NewClient(&redis.Options{
+	const (
+		flushEvery   = 20 * time.Millisecond
+		maxQueueDrain = 4096                
+	)
+
+	t := time.NewTicker(flushEvery)
+	defer t.Stop()
+
+	sums := make(map[int64]int64)
+	counts := make(map[int64]int64)
+
+	flush := func() {
+		if len(sums) == 0 {
+			return
+		}
+		pipe := s.c.Pipeline()
+		for sec, sum := range sums {
+			key := "pay:sec:" + strconv.FormatInt(sec, 10)
+			pipe.HIncrBy(ctx, key, "sum", sum)
+			pipe.HIncrBy(ctx, key, "cnt", counts[sec])
+			pipe.ExpireNX(ctx, key, s.ttl)
+		}
+		_, _ = pipe.Exec(ctx) 
+		for k := range sums {
+			delete(sums, k)
+			delete(counts, k)
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return
+		case <-t.C:
+			flush()
+		case msg := <-s.in:
+			n := 0
+			for {
+				sums[msg.sec] += msg.amount
+				counts[msg.sec]++
+				n++
+				if n >= maxQueueDrain {
+					break
+				}
+				select {
+				case msg = <-s.in:
+				default:
+					goto drained
+				}
+			}
+		drained:
+		}
+	}
+}
+
+func NewRedisService(parent context.Context) (*RedisService, error) {
+	addr := getenv("REDIS_ADDR", "redis:6379")
+	ttlSec := getint("REDIS_TTL_SEC", 180)
+
+	rdb := redis.NewClient(&redis.Options{
 		Addr:         addr,
-		Password:     "",
-		DB:           0,
-		DialTimeout:  5 * time.Second,
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
-		PoolSize:     10,
-		MinIdleConns: 2,
-		MaxRetries:   3,
+		PoolSize:     64,
+		MinIdleConns: 16,
+		DialTimeout:  50 * time.Millisecond,
+		ReadTimeout:  50 * time.Millisecond,
+		WriteTimeout: 50 * time.Millisecond,
+		PoolTimeout:  50 * time.Millisecond,
 	})
 
-	rs := &RedisService{
-		client: client,
-		logger: logrus.New(),
-		ctx:    context.Background(),
+	ctx, cancel := context.WithTimeout(parent, 500*time.Millisecond)
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		cancel()
+		return nil, err
 	}
+	cancel()
 
-	if err := rs.HealthCheck(); err != nil {
-		rs.logger.WithError(err).Warn("Redis não disponível, funcionando sem cache")
-	} else {
-		rs.logger.Info("Redis conectado com sucesso")
+	ctx2, cancel2 := context.WithCancel(parent)
+	s := &RedisService{
+		c:      rdb,
+		ttl:    time.Duration(ttlSec) * time.Second,
+		in:     make(chan redisMsg, 1<<16),
+		cancel: cancel2,
 	}
-
-	return rs
+	s.wg.Add(1)
+	go s.run(ctx2)
+	return s, nil
 }
 
-func (rs *RedisService) HealthCheck() error {
-	ctx, cancel := context.WithTimeout(rs.ctx, 2*time.Second)
-	defer cancel()
-
-	return rs.client.Ping(ctx).Err()
-}
-
-func (rs *RedisService) GetProcessorHealth(processor string) (*ProcessorHealth, error) {
-	ctx, cancel := context.WithTimeout(rs.ctx, 1*time.Second)
-	defer cancel()
-
-	key := fmt.Sprintf("health:%s", processor)
-
-	data, err := rs.client.Get(ctx, key).Result()
-	if err != nil {
-		if err == redis.Nil {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("erro ao buscar health do Redis: %w", err)
-	}
-
-	var health ProcessorHealth
-	if err := json.Unmarshal([]byte(data), &health); err != nil {
-		return nil, fmt.Errorf("erro ao deserializar health: %w", err)
-	}
-
-	return &health, nil
-}
-
-func (rs *RedisService) SetProcessorHealth(processor string, health *ProcessorHealth) error {
-	ctx, cancel := context.WithTimeout(rs.ctx, 1*time.Second)
-	defer cancel()
-
-	key := fmt.Sprintf("health:%s", processor)
-
-	data, err := json.Marshal(health)
-	if err != nil {
-		return fmt.Errorf("erro ao serializar health: %w", err)
-	}
-
-	if err := rs.client.Set(ctx, key, data, 5*time.Second).Err(); err != nil {
-		return fmt.Errorf("erro ao salvar health no Redis: %w", err)
-	}
-
-	rs.logger.WithFields(logrus.Fields{
-		"processor":    processor,
-		"healthy":      health.Healthy,
-		"responseTime": health.LastResponseTime,
-		"successRate":  health.SuccessRate,
-	}).Debug("Health salvo no Redis")
-
-	return nil
-}
-
-func (rs *RedisService) UpdateProcessorHealth(processor string, success bool, responseTime int, errorMsg string) {
-	health, err := rs.GetProcessorHealth(processor)
-	if err != nil {
-		rs.logger.WithError(err).Warn("Erro ao obter health do Redis")
-		health = &ProcessorHealth{
-			Healthy:       true,
-			SuccessRate:   1.0,
-			TotalRequests: 0,
-			FailureCount:  0,
-		}
-	}
-
-	if health == nil {
-		health = &ProcessorHealth{
-			Healthy:       true,
-			SuccessRate:   1.0,
-			TotalRequests: 0,
-			FailureCount:  0,
-		}
-	}
-
-	health.TotalRequests++
-	health.LastCheck = time.Now()
-	health.LastResponseTime = responseTime
-
-	if success {
-		health.Healthy = true
-		health.LastError = ""
-	} else {
-		health.FailureCount++
-		health.Healthy = false
-		health.LastError = errorMsg
-	}
-
-	if health.TotalRequests > 0 {
-		health.SuccessRate = float64(health.TotalRequests-health.FailureCount) / float64(health.TotalRequests)
-	}
-
-	if health.FailureCount >= 3 {
-		health.Healthy = false
-	}
-
-	if health.SuccessRate < 0.8 {
-		health.Healthy = false
-	}
-
-	if err := rs.SetProcessorHealth(processor, health); err != nil {
-		rs.logger.WithError(err).Warn("Erro ao salvar health no Redis")
+func (s *RedisService) Enqueue(sec, amount int64) {
+	select {
+	case s.in <- redisMsg{sec: sec, amount: amount}:
+	default:
 	}
 }
 
-func (rs *RedisService) GetBestProcessor() (string, error) {
-	defaultHealth, err := rs.GetProcessorHealth("default")
-	if err != nil {
-		rs.logger.WithError(err).Warn("Erro ao obter health do default")
-	}
-
-	fallbackHealth, err := rs.GetProcessorHealth("fallback")
-	if err != nil {
-		rs.logger.WithError(err).Warn("Erro ao obter health do fallback")
-	}
-
-	if defaultHealth == nil && fallbackHealth == nil {
-		return "default", nil
-	}
-
-	if defaultHealth == nil && fallbackHealth != nil {
-		if fallbackHealth.Healthy {
-			return "fallback", nil
-		}
-		return "default", nil
-	}
-
-	if fallbackHealth == nil && defaultHealth != nil {
-		if defaultHealth.Healthy {
-			return "default", nil
-		}
-		return "fallback", nil
-	}
-
-	rs.logger.WithFields(logrus.Fields{
-		"default_healthy":        defaultHealth.Healthy,
-		"default_response_time":  defaultHealth.LastResponseTime,
-		"default_success_rate":   defaultHealth.SuccessRate,
-		"fallback_healthy":       fallbackHealth.Healthy,
-		"fallback_response_time": fallbackHealth.LastResponseTime,
-		"fallback_success_rate":  fallbackHealth.SuccessRate,
-	}).Debug("Comparando processadores")
-
-	if defaultHealth.Healthy && !fallbackHealth.Healthy {
-		return "default", nil
-	}
-
-	if !defaultHealth.Healthy && fallbackHealth.Healthy {
-		return "fallback", nil
-	}
-
-	if defaultHealth.Healthy && fallbackHealth.Healthy {
-		fallbackThreshold := float64(fallbackHealth.LastResponseTime) * 1.5
-		if float64(defaultHealth.LastResponseTime) <= fallbackThreshold {
-			return "default", nil
-		}
-		return "fallback", nil
-	}
-
-	return "default", nil
+func (s *RedisService) BumpBucket(ctx context.Context, sec int64, amount int64) {
+	s.Enqueue(sec, amount)
 }
 
-func (rs *RedisService) CachePaymentResult(correlationID string, result string) error {
-	ctx, cancel := context.WithTimeout(rs.ctx, 1*time.Second)
-	defer cancel()
-
-	key := fmt.Sprintf("payment:%s", correlationID)
-
-	if err := rs.client.Set(ctx, key, result, 1*time.Hour).Err(); err != nil {
-		return fmt.Errorf("erro ao cachear resultado: %w", err)
-	}
-
-	return nil
-}
-
-func (rs *RedisService) GetCachedPaymentResult(correlationID string) (string, error) {
-	ctx, cancel := context.WithTimeout(rs.ctx, 1*time.Second)
-	defer cancel()
-
-	key := fmt.Sprintf("payment:%s", correlationID)
-
-	result, err := rs.client.Get(ctx, key).Result()
-	if err != nil {
-		if err == redis.Nil {
-			return "", nil
-		}
-		return "", fmt.Errorf("erro ao buscar cache: %w", err)
-	}
-
-	return result, nil
-}
-
-func (rs *RedisService) CachePaymentsSummary(summaryKey string, summary *models.PaymentsSummaryResponse) error {
-	ctx, cancel := context.WithTimeout(rs.ctx, 1*time.Second)
-	defer cancel()
-
-	data, err := json.Marshal(summary)
-	if err != nil {
-		return fmt.Errorf("erro ao serializar summary: %w", err)
-	}
-
-	if err := rs.client.Set(ctx, summaryKey, data, 30*time.Second).Err(); err != nil {
-		return fmt.Errorf("erro ao cachear summary: %w", err)
-	}
-
-	rs.logger.WithField("summaryKey", summaryKey).Debug("Summary cacheado no Redis")
-	return nil
-}
-
-func (rs *RedisService) GetCachedPaymentsSummary(summaryKey string) (*models.PaymentsSummaryResponse, error) {
-	ctx, cancel := context.WithTimeout(rs.ctx, 1*time.Second)
-	defer cancel()
-
-	data, err := rs.client.Get(ctx, summaryKey).Result()
-	if err != nil {
-		if err == redis.Nil {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("erro ao buscar summary cache: %w", err)
-	}
-
-	var summary models.PaymentsSummaryResponse
-	if err := json.Unmarshal([]byte(data), &summary); err != nil {
-		return nil, fmt.Errorf("erro ao deserializar summary: %w", err)
-	}
-
-	return &summary, nil
-}
-
-func (rs *RedisService) IncrementSummary(processor string, amount float64) error {
-	ctx, cancel := context.WithTimeout(rs.ctx, 1*time.Second)
-	defer cancel()
-
-	countKey := fmt.Sprintf("summary:all:%s:count", processor)
-	amountKey := fmt.Sprintf("summary:all:%s:amount", processor)
-
-	pipe := rs.client.Pipeline()
-	pipe.Incr(ctx, countKey)
-	pipe.IncrByFloat(ctx, amountKey, amount)
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("erro ao incrementar summary: %w", err)
-	}
-	return nil
-}
-
-func (rs *RedisService) GetLiveSummary() (*models.PaymentsSummaryResponse, error) {
-	ctx, cancel := context.WithTimeout(rs.ctx, 1*time.Second)
-	defer cancel()
-
-	keys := []string{
-		"summary:all:default:count",
-		"summary:all:default:amount",
-		"summary:all:fallback:count",
-		"summary:all:fallback:amount",
-	}
-	pipe := rs.client.Pipeline()
-	cmds := make([]*redis.StringCmd, 0, len(keys))
-	for _, k := range keys {
-		cmds = append(cmds, pipe.Get(ctx, k))
-	}
-	_, _ = pipe.Exec(ctx)
-
-	parseInt := func(cmd *redis.StringCmd) int {
-		v, err := cmd.Int()
+func (s *RedisService) Purge(ctx context.Context) {
+	var cursor uint64
+	for i := 0; i < 1000; i++ {
+		keys, cur, err := s.c.Scan(ctx, cursor, "pay:sec:*", 1000).Result()
 		if err != nil {
-			return 0
+			break
 		}
+		if len(keys) > 0 {
+			_ = s.c.Del(ctx, keys...).Err()
+		}
+		cursor = cur
+		if cursor == 0 {
+			break
+		}
+	}
+}
+
+
+func getenv(k, d string) string {
+	if v := os.Getenv(k); v != "" {
 		return v
 	}
-	parseFloat := func(cmd *redis.StringCmd) float64 {
-		v, err := cmd.Float64()
-		if err != nil {
-			return 0
-		}
-		return v
-	}
-
-	resp := &models.PaymentsSummaryResponse{
-		Default: models.ProcessorSummary{
-			TotalRequests: parseInt(cmds[0]),
-			TotalAmount:   parseFloat(cmds[1]),
-		},
-		Fallback: models.ProcessorSummary{
-			TotalRequests: parseInt(cmds[2]),
-			TotalAmount:   parseFloat(cmds[3]),
-		},
-	}
-	return resp, nil
+	return d
 }
 
-func (rs *RedisService) TryLockCorrelation(correlationID string, ttl time.Duration) (bool, error) {
-	ctx, cancel := context.WithTimeout(rs.ctx, 50*time.Millisecond)
-	defer cancel()
-	key := fmt.Sprintf("dedupe:%s", correlationID)
-	ok, err := rs.client.SetNX(ctx, key, "1", ttl).Result()
-	if err != nil {
-		return false, fmt.Errorf("erro ao tentar dedupe no Redis: %w", err)
+func getint(k string, d int) int {
+	if v := os.Getenv(k); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
 	}
-	return ok, nil
+	return d
 }

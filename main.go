@@ -2,68 +2,88 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"log"
 	"net/http"
-	"runtime"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
 	"time"
 
-	"my-rinha-go/database"
-	"my-rinha-go/handlers"
-	"my-rinha-go/repositories"
-	"my-rinha-go/services"
+	"myRinhaGo/database"
+	"myRinhaGo/handlers"
+	"myRinhaGo/repositories"
+	"myRinhaGo/services"
 )
 
-func helloHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprint(w, "Olá, Rinha de Backend!")
+func main() {
+	log.SetFlags(0)
+	port := getenv("APP_PORT", "8080")
+	window := getint("WINDOW_SECONDS", 600)
+	queueSize := getint("QUEUE_SIZE", 200000)
+	batchSize := getint("BATCH_SIZE", 2000)
+	batchMax := time.Duration(getint("BATCH_MAX_MS", 50)) * time.Millisecond
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	pool, err := database.NewPool(ctx)
+	if err != nil {
+		log.Fatalf("pg: %v", err)
+	}
+	defer pool.Close()
+
+	writer := repositories.NewPaymentWriter(pool, queueSize, batchSize, batchMax)
+	go writer.Run(ctx)
+
+	rds, err := services.NewRedisService(ctx)
+	if err != nil {
+		log.Printf("redis degraded: %v", err)
+		rds = nil
+	}
+
+	services.StartHealthUpdater(ctx, pool)
+
+	svc := services.NewPaymentService(int64(window), writer, rds)
+	h := handlers.NewPaymentHandler(svc)
+
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadTimeout:       2 * time.Second,
+		ReadHeaderTimeout: 1 * time.Second,
+		WriteTimeout:      2 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	go func() {
+		log.Printf("listening on :%s", port)
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("http: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	_ = srv.Shutdown(ctx2)
 }
 
-func main() {
-	runtime.GOMAXPROCS(2)
-	dbConfig := database.NewDatabaseConfig()
-	db, err := database.ConnectToDatabase(dbConfig)
-	if err != nil {
-		log.Fatalf("Erro ao conectar ao banco de dados: %v", err)
+func getenv(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
 	}
-	defer db.Close()
-
-	paymentRepository := repositories.NewPaymentRepository(db)
-
-	if err := paymentRepository.HealthCheck(); err != nil {
-		log.Fatalf("Health check do banco falhou: %v", err)
+	return d
+}
+func getint(k string, d int) int {
+	if v := os.Getenv(k); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
 	}
-
-	paymentRepository.StartAsyncWorkers(4, 150, 3*time.Millisecond)
-
-	redisService := services.NewRedisService()
-	paymentService := services.NewPaymentService(paymentRepository, redisService)
-	paymentHandler := handlers.NewPaymentHandler(paymentService)
-
-	ctx := context.Background()
-	hu := services.NewHealthUpdater(redisService)
-	hu.Start(ctx)
-
-	http.HandleFunc("/", helloHandler)
-	http.HandleFunc("/payments", paymentHandler.PostPayments)
-	http.HandleFunc("/payments-summary", paymentHandler.GetPaymentsSummary)
-
-	port := "8080"
-	fmt.Printf("Servidor iniciado na porta %s\n", port)
-	fmt.Println("Endpoints disponíveis:")
-	fmt.Println("  GET  / - Página inicial")
-	fmt.Println("  POST /payments - Processar pagamentos (com estratégia inteligente)")
-	fmt.Println("  GET  /payments-summary - Resumo de pagamentos (com cache)")
-	fmt.Println("Banco de dados:", "PostgreSQL conectado")
-	fmt.Println("Cache:", "Redis conectado")
-	fmt.Println("Estratégia:", "Roteamento inteligente baseado em métricas")
-
-	s := &http.Server{
-		Addr:              ":" + port,
-		Handler:           nil,
-		ReadHeaderTimeout: 750 * time.Millisecond,
-		ReadTimeout:       2 * time.Second,
-		WriteTimeout:      2 * time.Second,
-		IdleTimeout:       30 * time.Second,
-	}
-	log.Fatal(s.ListenAndServe())
+	return d
 }

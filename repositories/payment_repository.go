@@ -2,221 +2,81 @@ package repositories
 
 import (
 	"context"
-	"database/sql"
-	"fmt"
-	"strings"
 	"time"
 
-	"my-rinha-go/models"
+	"myRinhaGo/models"
 
-	_ "github.com/lib/pq"
-	"github.com/sirupsen/logrus"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type PaymentRepository struct {
-	db            *sql.DB
-	logger        *logrus.Logger
-	enqueueCh     chan *models.PaymentRecord
-	batchSize     int
-	batchInterval time.Duration
+type PaymentWriter struct {
+	pool      *pgxpool.Pool
+	ch        chan models.Payment
+	batchSize int
+	batchMax  time.Duration
 }
 
-func NewPaymentRepository(db *sql.DB) *PaymentRepository {
-	return &PaymentRepository{
-		db:     db,
-		logger: logrus.New(),
+func NewPaymentWriter(pool *pgxpool.Pool, queueSize, batchSize int, batchMax time.Duration) *PaymentWriter {
+	if queueSize < 1 {
+		queueSize = 1000
 	}
-}
-
-func (pr *PaymentRepository) SavePayment(record *models.PaymentRecord) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
-	defer cancel()
-
-	query := `
-		INSERT INTO payments (correlation_id, amount, processor, processed_at, created_at)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id
-	`
-	err := pr.db.QueryRowContext(
-		ctx,
-		query,
-		record.CorrelationID,
-		record.Amount,
-		record.Processor,
-		record.ProcessedAt,
-		record.CreatedAt,
-	).Scan(&record.ID)
-
-	if err != nil {
-		pr.logger.WithError(err).Error("Erro ao salvar pagamento no banco")
-		return fmt.Errorf("erro ao salvar pagamento: %w", err)
+	if batchSize < 1 {
+		batchSize = 1000
 	}
-	return nil
-}
-
-func (pr *PaymentRepository) GetPaymentByCorrelationID(correlationID string) (*models.PaymentRecord, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-
-	query := `
-		SELECT id, correlation_id, amount, processor, processed_at, created_at
-		FROM payments
-		WHERE correlation_id = $1
-	`
-	record := &models.PaymentRecord{}
-	err := pr.db.QueryRowContext(ctx, query, correlationID).Scan(
-		&record.ID,
-		&record.CorrelationID,
-		&record.Amount,
-		&record.Processor,
-		&record.ProcessedAt,
-		&record.CreatedAt,
-	)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		pr.logger.WithError(err).Error("Erro ao buscar pagamento no banco")
-		return nil, fmt.Errorf("erro ao buscar pagamento: %w", err)
+	if batchMax <= 0 {
+		batchMax = 50 * time.Millisecond
 	}
-	return record, nil
-}
-
-func (pr *PaymentRepository) GetPaymentsSummary(from, to *time.Time) (map[string]models.ProcessorSummary, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	query := `
-		SELECT
-			processor,
-			COUNT(*) as total_requests,
-			SUM(amount) as total_amount
-		FROM payments
-		WHERE ($1::timestamp IS NULL OR processed_at >= $1)
-		  AND ($2::timestamp IS NULL OR processed_at <= $2)
-		GROUP BY processor
-	`
-	rows, err := pr.db.QueryContext(ctx, query, from, to)
-	if err != nil {
-		pr.logger.WithError(err).Error("Erro ao consultar resumo de pagamentos")
-		return nil, fmt.Errorf("erro ao consultar resumo: %w", err)
-	}
-	defer rows.Close()
-
-	summary := make(map[string]models.ProcessorSummary)
-	for rows.Next() {
-		var processor string
-		var totalRequests int
-		var totalAmount float64
-		if err := rows.Scan(&processor, &totalRequests, &totalAmount); err != nil {
-			pr.logger.WithError(err).Error("Erro ao fazer scan do resultado")
-			return nil, fmt.Errorf("erro ao processar resultado: %w", err)
-		}
-		summary[processor] = models.ProcessorSummary{
-			TotalRequests: totalRequests,
-			TotalAmount:   totalAmount,
-		}
-	}
-	return summary, nil
-}
-
-func (pr *PaymentRepository) HealthCheck() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	if err := pr.db.PingContext(ctx); err != nil {
-		pr.logger.WithError(err).Error("Health check do banco falhou")
-		return fmt.Errorf("banco indisponível: %w", err)
-	}
-	return nil
-}
-
-func (pr *PaymentRepository) StartAsyncWorkers(workers int, batchSize int, batchInterval time.Duration) {
-	if pr.enqueueCh != nil {
-		return
-	}
-	if workers <= 0 {
-		workers = 2
-	}
-	if batchSize <= 0 {
-		batchSize = 100
-	}
-	if batchInterval <= 0 {
-		batchInterval = 3 * time.Millisecond
-	}
-	pr.batchSize = batchSize
-	pr.batchInterval = batchInterval
-	pr.enqueueCh = make(chan *models.PaymentRecord, batchSize*200)
-	for i := 0; i < workers; i++ {
-		go pr.worker()
+	return &PaymentWriter{
+		pool:      pool,
+		ch:        make(chan models.Payment, queueSize),
+		batchSize: batchSize,
+		batchMax:  batchMax,
 	}
 }
 
-func (pr *PaymentRepository) EnqueuePayment(record *models.PaymentRecord) {
-	if pr.enqueueCh == nil {
-		_ = pr.SavePayment(record)
-		return
-	}
+func (w *PaymentWriter) Enqueue(p models.Payment) bool {
 	select {
-	case pr.enqueueCh <- record:
+	case w.ch <- p:
+		return true
 	default:
-		// Canal cheio: pequena espera para backpressure controlado
-		t := time.NewTimer(2 * time.Millisecond)
-		select {
-		case pr.enqueueCh <- record:
-			if !t.Stop() {
-				<-t.C
-			}
-		default:
-			if !t.Stop() {
-				<-t.C
-			}
-			pr.logger.Warn("Fila de pagamentos cheia, descartando pagamento para preservar latência")
-		}
+		return false
 	}
 }
 
-func (pr *PaymentRepository) worker() {
-	batch := make([]*models.PaymentRecord, 0, pr.batchSize)
-	ticker := time.NewTicker(pr.batchInterval)
+func (w *PaymentWriter) Run(ctx context.Context) {
+	batch := make([]models.Payment, 0, w.batchSize)
+	ticker := time.NewTicker(w.batchMax)
 	defer ticker.Stop()
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		_ = w.copyInsert(ctx, batch) // best-effort
+		batch = batch[:0]
+	}
+
 	for {
 		select {
-		case rec := <-pr.enqueueCh:
-			if rec != nil {
-				batch = append(batch, rec)
-				if len(batch) >= pr.batchSize {
-					pr.flushBatch(batch)
-					batch = batch[:0]
-				}
+		case <-ctx.Done():
+			flush()
+			return
+		case p := <-w.ch:
+			batch = append(batch, p)
+			if len(batch) >= w.batchSize {
+				flush()
 			}
 		case <-ticker.C:
-			if len(batch) > 0 {
-				pr.flushBatch(batch)
-				batch = batch[:0]
-			}
+			flush()
 		}
 	}
 }
 
-func (pr *PaymentRepository) flushBatch(batch []*models.PaymentRecord) {
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-	defer cancel()
-	var (
-		b    strings.Builder
-		args []interface{}
-	)
-	b.WriteString("INSERT INTO payments (correlation_id, amount, processor, processed_at, created_at) VALUES ")
-	for i, r := range batch {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		base := i*5 + 1
-		b.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d)", base, base+1, base+2, base+3, base+4))
-		args = append(args, r.CorrelationID, r.Amount, r.Processor, r.ProcessedAt, r.CreatedAt)
-	}
-	_, err := pr.db.ExecContext(ctx, b.String(), args...)
-	if err != nil {
-		pr.logger.WithError(err).Error("Erro ao inserir batch de pagamentos")
-	}
+func (w *PaymentWriter) copyInsert(ctx context.Context, rows []models.Payment) error {
+	src := pgx.CopyFromSlice(len(rows), func(i int) ([]interface{}, error) {
+		return []interface{}{rows[i].Ts, rows[i].Amount}, nil
+	})
+	_, err := w.pool.CopyFrom(ctx, pgx.Identifier{"payments"}, []string{"ts", "amount"}, src)
+	return err
 }

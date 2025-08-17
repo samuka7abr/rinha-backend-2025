@@ -1,12 +1,13 @@
 package services
 
 import (
-	"my-rinha-go/models"
-	"time"
+	"context"
+
+	"myRinhaGo/models"
 )
 
-type PaymentServiceInterface interface {
-	ProcessPayment(req models.PaymentRequest) (*models.PaymentRecord, error)
-	GetPaymentsSummary(from, to *time.Time) (*models.PaymentsSummaryResponse, error)
+type PaymentService interface {
+	Add(ctx context.Context, p models.Payment) bool
+	Summary(fromSec, toSec int64) (sum int64, count int64)
+	Purge(ctx context.Context)
 }
- 

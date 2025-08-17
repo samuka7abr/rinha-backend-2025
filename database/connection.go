@@ -1,73 +1,41 @@
 package database
 
 import (
-	"database/sql"
-	"fmt"
+	"context"
 	"os"
 	"time"
 
-	_ "github.com/lib/pq"
-	"github.com/sirupsen/logrus"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type DatabaseConfig struct {
-	Host     string
-	Port     string
-	User     string
-	Password string
-	DBName   string
-}
-
-func NewDatabaseConfig() *DatabaseConfig {
-	return &DatabaseConfig{
-		Host:     getEnv("DB_HOST", "localhost"),
-		Port:     getEnv("DB_PORT", "5432"),
-		User:     getEnv("DB_USER", "admin"),
-		Password: getEnv("DB_PASSWORD", "123"),
-		DBName:   getEnv("DB_NAME", "rinha"),
-	}
-}
-
-func (dc *DatabaseConfig) ConnectionString() string {
-	return fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		dc.Host, dc.Port, dc.User, dc.Password, dc.DBName,
-	)
-}
-
-func ConnectToDatabase(config *DatabaseConfig) (*sql.DB, error) {
-	logger := logrus.New()
-	logger.WithFields(logrus.Fields{
-		"host":   config.Host,
-		"port":   config.Port,
-		"dbname": config.DBName,
-		"user":   config.User,
-	}).Info("Tentando conectar ao banco de dados")
-
-	db, err := sql.Open("postgres", config.ConnectionString())
+func NewPool(ctx context.Context) (*pgxpool.Pool, error) {
+	dsn := getenv("POSTGRES_DSN", "postgres://admin:admin@postgres:5432/rinha?sslmode=disable")
+	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		logger.WithError(err).Error("Erro ao abrir conexão com o banco")
-		return nil, fmt.Errorf("erro ao conectar ao banco: %w", err)
+		return nil, err
 	}
+	cfg.MaxConns = 16
+	cfg.MinConns = 4
+	cfg.MaxConnIdleTime = time.Minute
+	cfg.MaxConnLifetime = 30 * time.Minute
+	cfg.HealthCheckPeriod = 30 * time.Second
 
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(10)
-	db.SetConnMaxLifetime(5 * time.Minute)
-	db.SetConnMaxIdleTime(2 * time.Minute)
-
-	if err = db.Ping(); err != nil {
-		db.Close()
-		logger.WithError(err).Error("Erro ao fazer ping no banco")
-		return nil, fmt.Errorf("erro ao testar conexão: %w", err)
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
 	}
-	logger.Info("Conexão com o banco estabelecida com sucesso")
-	return db, nil
+	ctxPing, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := pool.Ping(ctxPing); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return pool, nil
 }
 
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
+func getenv(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
 	}
-	return defaultValue
+	return d
 }
- 
